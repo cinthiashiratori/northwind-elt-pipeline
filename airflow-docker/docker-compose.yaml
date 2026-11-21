@@ -1,0 +1,155 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: ${AIRFLOW_IMAGE_NAME:-northwind-airflow:3.1.8-meltano}
+  env_file:
+    - path: .env
+      required: false
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:?Set AIRFLOW_DB_USER in .env}:${AIRFLOW_DB_PASSWORD:?Set AIRFLOW_DB_PASSWORD in .env}@postgres/${AIRFLOW_DB_NAME:?Set AIRFLOW_DB_NAME in .env}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-apiserver:8080/execution/"
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:?Set AIRFLOW__API_AUTH__JWT_SECRET in .env}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # Meltano/pandas/psycopg2 vêm da imagem custom (Dockerfile). Vazio evita pip no entrypoint.
+    _PIP_ADDITIONAL_REQUIREMENTS: ""
+    AIRFLOW_CONFIG: "/opt/airflow/config/airflow.cfg"
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/data:/data
+    - ${AIRFLOW_PROJ_DIR:-.}/meltano:/meltano
+    - ${AIRFLOW_PROJ_DIR:-.}/../source/data:/source_data:ro
+  user: "${AIRFLOW_UID:-50000}:0"
+  # Garante que host.docker.internal resolva para o host em Linux.
+  # No macOS e Windows (Docker Desktop) esse DNS já existe nativamente — esta linha é ignorada.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  # Banco de metadados do Airflow — uso interno, sem porta exposta no host
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER:?Set AIRFLOW_DB_USER in .env}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?Set AIRFLOW_DB_PASSWORD in .env}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:?Set AIRFLOW_DB_NAME in .env}
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${AIRFLOW_DB_USER}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # Banco de destino final da pipeline — acessível no host pela porta 5433
+  postgres-final:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${FINAL_DB_USER:?Set FINAL_DB_USER in .env}
+      POSTGRES_PASSWORD: ${FINAL_DB_PASSWORD:?Set FINAL_DB_PASSWORD in .env}
+      POSTGRES_DB: ${FINAL_DB_NAME:?Set FINAL_DB_NAME in .env}
+    volumes:
+      - postgres-final-volume:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${FINAL_DB_USER}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test:
+        ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # O scheduler executa 'meltano install' antes de iniciar.
+  # Neste ponto o meltano já está instalado via _PIP_ADDITIONAL_REQUIREMENTS
+  # (processado pelo entrypoint do Airflow antes do comando principal).
+  # O volume /meltano é compartilhado — os plugins instalados ficam disponíveis
+  # para todos os containers que montam o mesmo volume.
+  airflow-scheduler:
+    <<: *airflow-common
+    command: bash -c "cd /meltano && meltano install && airflow scheduler"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
+        find /data -type d -exec chmod 777 {} +
+        chown -R "${AIRFLOW_UID:-50000}:0" /meltano
+        /entrypoint airflow version
+        /entrypoint airflow config list >/dev/null
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:?Set _AIRFLOW_WWW_USER_USERNAME in .env}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:?Set _AIRFLOW_WWW_USER_PASSWORD in .env}
+      # airflow-init não instala pacotes extras — responsabilidade dos serviços de runtime
+      _PIP_ADDITIONAL_REQUIREMENTS: ""
+    user: "0:0"
+
+volumes:
+  postgres-db-volume:
+  postgres-final-volume:

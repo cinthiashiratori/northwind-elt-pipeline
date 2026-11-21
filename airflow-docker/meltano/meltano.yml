@@ -1,0 +1,56 @@
+version: 1
+default_environment: dev
+project_id: 019d5373-0902-72cf-a0d5-b8c2428aedc3
+
+environments:
+  - name: dev
+  - name: staging
+  - name: prod
+
+plugins:
+  extractors:
+    - name: tap-postgres
+      variant: meltanolabs
+      select:
+        - "public-*.*"
+      # Credentials are NOT stored here. Meltano reads them from the environment:
+      # TAP_POSTGRES_USER and TAP_POSTGRES_PASSWORD (set in airflow-docker/.env).
+      config:
+        host: host.docker.internal
+        port: 5432
+        database: northwind
+        filter_schemas: ["public"]
+
+    - name: tap-csv
+      variant: meltanolabs
+      pip_url: git+https://github.com/MeltanoLabs/tap-csv.git
+      config:
+        files:
+          - entity: order_details
+            path: /source_data/order_details.csv
+            keys: [order_id, product_id]
+
+  loaders:
+    - name: target-jsonl
+      variant: andyh1203
+
+    - name: target-jsonl--postgres
+      inherit_from: target-jsonl
+      namespace: target_jsonl_postgres
+      config:
+        destination_path: /data/postgres
+
+    - name: target-jsonl--csv
+      inherit_from: target-jsonl
+      namespace: target_jsonl_csv
+      config:
+        destination_path: /data/csv
+
+jobs:
+  - name: extract-postgres-to-local
+    tasks:
+      - tap-postgres target-jsonl--postgres
+
+  - name: extract-csv-to-local
+    tasks:
+      - tap-csv target-jsonl--csv

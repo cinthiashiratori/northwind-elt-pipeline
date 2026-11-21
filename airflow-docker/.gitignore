@@ -1,0 +1,24 @@
+# Meltano — gerado em runtime (venvs dos plugins, banco interno SQLite)
+meltano/.meltano/
+meltano/*.db
+
+# Airflow — gerado em runtime
+logs/
+config/
+
+# Dados intermediários gerados pela pipeline
+# (arquivos JSONL extraídos — artefatos de execução, não código)
+# A evidência final fica em /output/ na raiz do projeto e é versionada
+data/postgres/*
+!data/postgres/.gitkeep
+data/csv/*
+!data/csv/.gitkeep
+
+# Variáveis de ambiente
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/

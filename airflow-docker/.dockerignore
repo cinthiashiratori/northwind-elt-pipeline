@@ -1,0 +1,5 @@
+.git
+logs
+data
+meltano/.meltano
+**/__pycache__
